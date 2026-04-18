@@ -1,0 +1,387 @@
+# NeuroRead — Complete Architecture & Project Deep-Dive
+
+## 1. What Is NeuroRead?
+
+**NeuroRead** is an accessibility-first, AI-powered reading platform designed to reduce cognitive load for individuals with **dyslexia, ADHD**, and other reading difficulties. It combines **LLM-based text simplification**, **real-time NLP analytics**, **adaptive learning with research-backed ML models**, and a **deeply accessible frontend** into a single production-deployed full-stack application.
+
+- **Live Frontend:** [https://nr-three-puce.vercel.app](https://nr-three-puce.vercel.app) (Vercel)
+- **Live Backend API:** [https://neuroread-5icn.onrender.com](https://neuroread-5icn.onrender.com) (Render)
+
+---
+
+## 2. High-Level Architecture
+
+```mermaid
+graph TB
+    subgraph Frontend["Frontend (React + Vite + TypeScript)"]
+        UI["Accessible UI Layer<br/>TailwindCSS, Framer Motion, GSAP"]
+        Store["Zustand State Management"]
+        API_SVC["API Service Layer<br/>fetch + timeout + retry"]
+    end
+
+    subgraph Backend["Backend (FastAPI + Python)"]
+        Routes["30+ API Endpoints<br/>(Assistive, Learning, Analytics)"]
+        NLP["NLP Pipeline<br/>spaCy, textstat, NLTK"]
+        LLM["LLM Client<br/>Groq API (LLaMA 3.3 70B)"]
+        ML["Adaptive ML Engine<br/>BKT, IRT, SM-2, ZPD"]
+        DB["SQLite + SQLAlchemy ORM"]
+        Session["Session Store<br/>Redis / In-Memory Fallback"]
+        TTS["Text-to-Speech (gTTS)"]
+    end
+
+    UI --> Store
+    Store --> API_SVC
+    API_SVC -->|HTTP / JSON| Routes
+    Routes --> NLP
+    Routes --> LLM
+    Routes --> ML
+    Routes --> DB
+    Routes --> Session
+    Routes --> TTS
+```
+
+---
+
+## 3. Backend Architecture (FastAPI)
+
+### 3.1 Entry Point — [main.py](file:///e:/NR-main/backend/app/main.py)
+
+FastAPI app with:
+- **CORS middleware** (open origins for cross-origin frontend)
+- **Request logging middleware** (every request logged with method/path/status)
+- **Global exception handlers** — `RequestValidationError`, `HTTPException`, and catch-all `Exception`
+- **Startup hook** to auto-create SQLite tables via SQLAlchemy
+- **Safe route loader** — `safe_include()` dynamically loads routes and logs failures without crashing the server
+
+### 3.2 Route Modules (~30 endpoints)
+
+| Category | Endpoints | Purpose |
+|---|---|---|
+| **Assistive** | `/assistive/simplify`, `/rewrite`, `/tutor`, `/tts`, `/vocab-card`, `/document`, `/heatmap`, `/concept-graph`, `/chunk`, `/companion`, `/annotate` | Text simplification, rewriting, AI tutoring, audio generation, concept graphs, document upload (PDF/DOCX) |
+| **Learning** | `/learning/phonics`, `/exercises`, `/spelling`, `/comprehension`, `/flashcards`, `/sound-match`, `/build-word`, `/rhyme`, `/picture-match`, `/lesson`, `/check-answer`, `/progress` | Dyslexia-specific learning exercises, phonics, spelling practice |
+| **Adaptive Learning API** | `/api/learning/session/start`, `/session/{id}/answer`, `/session/{id}/skills`, `/session/{id}/recommend`, `/practice/generate`, `/practice/evaluate/dictation` | Full adaptive learning loop with BKT/IRT/SM-2 |
+| **Analytics** | `/analytics/dashboard/{userId}`, `/analytics/session` | Session tracking, cognitive load trends, improvement visualization |
+| **Personalization** | `/personalization/update`, `/personalization/difficulty/{userId}` | User profile adaptation based on reading behavior |
+
+---
+
+### 3.3 Core AI Pipeline — Text Simplification
+
+The crown jewel of the backend. Here's the full pipeline:
+
+```mermaid
+flowchart LR
+    A["Raw Text Input"] --> B["Cognitive Load Analysis<br/>(spaCy + textstat)"]
+    B --> C{"Auto-Select<br/>Level 1/2/3"}
+    C --> D["LLM Simplification<br/>(Groq LLaMA 3.3 70B)"]
+    D --> E["Re-Analyze<br/>Simplified Text"]
+    E --> F["Compute Reduction %"]
+    F --> G["Return Structured JSON<br/>+ Impact Summary"]
+```
+
+#### Cognitive Load Scoring Formula — [cognitive_load.py](file:///e:/NR-main/backend/app/services/cognitive_load.py)
+
+**Score Range:** 0 (easy) → 100 (hard), computed as a weighted sum:
+
+| Factor | Weight | Metric | Source |
+|---|---|---|---|
+| Readability | 40% | `1 - (Flesch Reading Ease / 100)` | `textstat` |
+| Sentence Length | 30% | `(avg_words_per_sentence - 5) / 30` | `spaCy` sentencizer |
+| Complex Vocabulary | 30% | `difficult_words / total_words / 0.30` | `textstat.difficult_words()` |
+
+**Final Score:** `100 × (0.4 × readability + 0.3 × sentence + 0.3 × vocabulary)` → clamped [0, 100]
+
+This scoring engine also provides:
+- **Sentence-level heatmap** — per-sentence cognitive load scores
+- **Difficult word extraction** with character offsets (for UI highlighting)
+- **Estimated reading time** (words / 200 WPM)
+
+#### LLM Integration — [llm_client.py](file:///e:/NR-main/backend/app/services/llm_client.py)
+
+- Uses **Groq API** (OpenAI-compatible interface) with **LLaMA 3.3 70B Versatile**
+- Temperature: **0.3** (low variance for consistent simplification)
+- Timeout: **15s**, max retries: **2**
+- Returns structured JSON: `simplified_text`, `bullet_points`, `definitions`, `step_by_step_explanation`
+- **Fallback logic**: if LLM fails → split sentences, truncate, return raw
+
+#### IRT-Based Difficulty Detection — [simplification_engine.py](file:///e:/NR-main/backend/app/services/simplification_engine.py)
+
+Runs **before simplification** to proactively tell the user if text needs simplifying:
+- Maps Flesch-Kincaid Grade Level to **IRT theta scale**: `difficulty = (FK_grade - 6) / 3.0`
+- Compares against user ability using **ZPD boundary** (should_simplify = difficulty > ability + 0.5)
+
+---
+
+### 3.4 Adaptive Learning ML Engine — [ml/](file:///e:/NR-main/backend/app/ml)
+
+This is the most technically impressive part of the project — **4 research-backed ML models** working together:
+
+#### 🔬 Bayesian Knowledge Tracing (BKT) — [bkt_engine.py](file:///e:/NR-main/backend/app/ml/bkt_engine.py)
+> *Reference: Corbett & Anderson (1994)*
+
+Tracks **P(know)** for each skill (bd_confusion, pq_confusion, phonics, spelling, comprehension):
+- **4 parameters**: P(init)=0.1, P(transit)=0.09, P(slip)=0.10, P(guess)=0.25
+- Bayesian update: `P(know | obs) = P(obs | know) × P(know) / P(obs)`
+- Learning transition: `P(know_new) = posterior + (1 - posterior) × P(transit)`
+- **Mastery threshold**: P(know) ≥ 0.85
+
+#### 📊 Item Response Theory (IRT) — [irt_scorer.py](file:///e:/NR-main/backend/app/ml/irt_scorer.py)
+> *Reference: Lord (1952) — 1-Parameter Logistic / Rasch Model*
+
+Estimates student **ability (theta)** on a [-3, +3] scale:
+- `P(correct) = 1 / (1 + exp(-(ability - difficulty)))`
+- Gradient-based ability update: `delta = correct - P(correct)`
+- Maps ability to approximate grade level (0-12)
+
+#### 📅 SM-2 Spaced Repetition — [sm2_scheduler.py](file:///e:/NR-main/backend/app/ml/sm2_scheduler.py)
+> *Reference: Wozniak (1987) — SuperMemo Algorithm*
+
+Schedules when to review each skill:
+- Rep 0 → 1 day, Rep 1 → 6 days, Rep n → `interval × easiness_factor`
+- Easiness factor updated per-answer quality (0-5 scale)
+- Minimum easiness: 1.3 (accounts for dyslexia's higher forgetting rates)
+- Due checking with human-readable labels ("Tomorrow", "In 3 days", etc.)
+
+#### 🎯 Zone of Proximal Development (ZPD) — [zpd_flow.py](file:///e:/NR-main/backend/app/ml/zpd_flow.py)
+> *Reference: Vygotsky (1978)*
+
+Classifies exercise difficulty relative to student ability:
+- **Too Easy**: ability > difficulty + 0.3 (boredom zone)
+- **ZPD**: within ±0.3 theta units (optimal learning zone)
+- **Too Hard**: difficulty > ability + 0.3 (frustration zone)
+- **Recommendation**: target difficulty = ability + 0.15 (just challenging enough)
+
+#### How They Work Together
+
+```mermaid
+sequenceDiagram
+    participant Student
+    participant API as Learning API
+    participant BKT as BKT Engine
+    participant IRT as IRT Scorer
+    participant ZPD as ZPD Flow
+    participant SM2 as SM-2 Scheduler
+    participant Gen as Exercise Generator
+
+    Student->>API: Start Session
+    API->>BKT: Init skill states (8 skills)
+    API->>ZPD: Get recommended difficulty
+    API->>Gen: Generate exercise
+    API-->>Student: First exercise
+
+    Student->>API: Submit answer
+    API->>BKT: Update P(know) for skill
+    API->>IRT: Update ability theta
+    API->>SM2: Update review schedule
+    API->>ZPD: Classify answer zone
+    API->>ZPD: Recommend next difficulty
+    API->>Gen: Generate next exercise
+    API-->>Student: Feedback + next exercise + stats
+```
+
+### 3.5 Exercise Generator — [exercise_generator.py](file:///e:/NR-main/backend/app/ml/exercise_generator.py)
+
+**435 lines** of curated, difficulty-calibrated exercises across 8 skill categories:
+
+| Skill | Exercise Types | Difficulty Range |
+|---|---|---|
+| `bd_confusion` | Phonics, matching, spelling | 0.2 – 0.8 |
+| `pq_confusion` | Phonics, spelling | 0.2 – 0.7 |
+| `phonics_initial` | Sound identification | 0.15 – 0.55 |
+| `phonics_final` | Ending sounds | 0.2 – 0.4 |
+| `spelling_cvc` | CVC words | 0.2 – 0.35 |
+| `spelling_ccvc` | CCVC/CVCC words | 0.5 – 0.65 |
+| `comprehension_short` | Short passages | 0.3 – 0.4 |
+| `comprehension_long` | Long passages | 0.65 – 0.75 |
+
+**Practice games** (8 types): dictation, error correction, word sorting, syllable tapping, word chains, sentence reconstruction, rhyme finder, flashcards, homophones
+
+### 3.6 Session Store — [session_store.py](file:///e:/NR-main/backend/app/session_store.py)
+
+- **Redis-first** with in-memory fallback
+- Stores BKT state, IRT estimates, SM-2 schedules, exercise history per session
+- 24-hour TTL, thread-safe singleton
+
+### 3.7 Database Layer
+
+- **SQLite** via SQLAlchemy ORM
+- **Models**: `UserProfile` (adaptive metrics), `ReadingSession` (per-session analytics), `AnalyticsCache` (pre-computed dashboards)
+
+---
+
+## 4. Frontend Architecture (React + Vite + TypeScript)
+
+### 4.1 Application Modes
+
+The app operates in **4 distinct modes**, all within a single-page app:
+
+| Mode | Component | Purpose |
+|---|---|---|
+| **Assistive** | `AssistiveMode` + `SimplifierModal` | AI text simplification, TTS, rewriting, vocabulary cards, AI tutor |
+| **Learning** | `LearningMode` | Adaptive BKT-powered learning sessions |
+| **Practice** | `PracticeMode` + `PracticeGames` | 8 gamified practice activities |
+| **Dashboard** | `Dashboard` | Analytics, trends, PDF clinical report export |
+
+### 4.2 Key Components (~25 components)
+
+| Component | Size | Purpose |
+|---|---|---|
+| `SimplifierModal` | 32KB | Full-featured simplification modal with cognitive panel, TTS, tutor, rewrite, vocab cards, interactive reader |
+| `LearningMode` | 27KB | Adaptive learning sessions with BKT live display |
+| `AssistiveMode` | 29KB | Main assistive reading interface |
+| `PracticeGames` | 14KB | Interactive dyslexia practice games |
+| `Dashboard` | 15KB | Analytics dashboard with Recharts visualizations + **PDF clinical report export (jsPDF)** |
+| `AccessibilityMenu` | 9KB | Floating accessibility panel (fonts, spacing, themes) |
+| `Onboarding` | 8KB | First-time user flow |
+| `BKTLiveDisplay` | 7KB | Real-time Bayesian knowledge visualization |
+| `BookBackground` | 6KB | Three.js animated decorative background |
+
+### 4.3 State Management
+
+**Zustand** store with persistence middleware ([accessibilityStore.ts](file:///e:/NR-main/frontend/frontend/src/stores/accessibilityStore.ts)):
+- 14+ accessibility settings (font, size, spacing, overlay color, TTS, chunk reading, dark mode, etc.)
+- All persisted to `localStorage` under key `neuroread-accessibility`
+
+### 4.4 Accessibility Features
+
+This is what makes NeuroRead a genuine assistive tool, not just a demo:
+
+| Feature | Implementation |
+|---|---|
+| **OpenDyslexic font** | Loaded via `@font-face`, toggleable |
+| **Color overlays** | 10 colors (cream, blue, pink, mint, etc.) with opacity control |
+| **Reading ruler** | CSS-based horizontal tracking aid |
+| **B/D/P/Q colored letters** | Character-level coloring for letter confusion |
+| **Chunk reading** | Show one sentence at a time |
+| **Theme system** | 5 themes (Warm Beige, Soft Green, Blue, Pink, Dark) |
+| **Variable typography** | Font size, letter spacing, word spacing, line height sliders |
+| **TTS integration** | Server-side gTTS with client audio player |
+| **Speech-to-text input** | Web Speech API dictation for text entry |
+| **Keyboard shortcuts** | `Esc` to close, `Ctrl+Enter` to simplify |
+
+### 4.5 API Service Layer — [api.js](file:///e:/NR-main/frontend/frontend/src/services/api.js)
+
+**287 lines** covering 20+ API functions with:
+- Centralized `request()` helper with **AbortController timeout** (20s)
+- **User ID management** via `localStorage`
+- **Profile mapping** (Dyslexia → `easy_read`, ADHD → `focus`, etc.)
+- Full error extraction from JSON or text responses
+
+### 4.6 Animations & Visual Polish
+
+- **GSAP + ScrollTrigger** for section reveal animations
+- **Framer Motion** for component transitions (accessibility menu slide-in, onboarding)
+- **Three.js** animated book background
+- **Shimmer loading states** for content placeholders
+- **Micro-animations**: hover effects, wave bars for audio, magnetic buttons
+
+---
+
+## 5. Deployment Architecture
+
+```mermaid
+graph LR
+    User["User Browser"] -->|HTTPS| Vercel["Vercel CDN<br/>(React Frontend)"]
+    Vercel -->|VITE_API_URL| Render["Render<br/>(FastAPI Backend)"]
+    Render --> SQLite["SQLite DB"]
+    Render -->|API Key| Groq["Groq Cloud<br/>(LLaMA 3.3 70B)"]
+```
+
+- **Frontend**: Vercel (global CDN, auto-deploy from GitHub)
+- **Backend**: Render (Python 3 environment, auto-deploy)
+- **Environment variables**: `GROQ_API_KEY` (backend), `VITE_API_URL` (frontend)
+
+---
+
+## 6. Unique Differentiators
+
+> [!IMPORTANT]
+> These are the things that make NeuroRead **stand out** from typical portfolio projects.
+
+### 6.1 Research-Backed ML, Not Just "Uses AI"
+Most projects call an LLM and call it "AI-powered." NeuroRead implements **4 published ML models** (BKT, IRT, SM-2, ZPD) from educational psychology research with proper citations. This demonstrates understanding of **learning science**, not just API calls.
+
+### 6.2 Quantitative Cognitive Load Measurement
+The weighted formula (Flesch + sentence length + vocabulary complexity) provides a **measurable, reproducible metric** — not a subjective rating. Before/after comparison with percentage reduction quantifies the actual impact of simplification.
+
+### 6.3 Full Adaptive Loop
+It's not a static app. The system adapts in real-time:
+- **BKT** knows what the student knows
+- **IRT** estimates their ability level
+- **ZPD** keeps exercises in the optimal learning zone
+- **SM-2** schedules reviews at the right time
+This is how **Duolingo-class adaptive learning** works.
+
+### 6.4 Clinical-Grade Reporting
+The PDF clinical report export feature (via jsPDF) targets a real use case: parents and teachers need documentation for educational assessments and IEP meetings. This shows product thinking beyond technical demo.
+
+### 6.5 Production Deployed & Environment-Aware
+Not a localhost demo — full CI/CD pipeline with environment-managed API keys, CORS configuration, and separate frontend/backend deployment.
+
+### 6.6 Genuine Accessibility, Not Token Effort
+14+ adjustable accessibility parameters, 10 color overlays, OpenDyslexic font, reading rulers, chunk reading, TTS, speech-to-text input, keyboard shortcuts — this is **WCAG-informed** design for a population that genuinely needs it.
+
+---
+
+## 7. Résumé KPIs & Bullet Points
+
+> [!TIP]
+> These are ready to paste into a résumé. Choose 4-5 that best match the job description.
+
+### Full-Stack Engineering
+
+- **Built and deployed a full-stack AI-powered accessibility platform** using React/TypeScript (Vite, Zustand, Framer Motion) and Python/FastAPI, with 30+ REST API endpoints, session management, and SQLAlchemy ORM — deployed on Vercel + Render
+
+- **Engineered a centralized API client** with AbortController-based timeouts, automatic retries, error normalization, and localStorage-based user session persistence across 20+ frontend API consumers
+
+### AI / ML Engineering
+
+- **Implemented 4 research-backed ML models** (Bayesian Knowledge Tracing, Item Response Theory, SM-2 Spaced Repetition, Zone of Proximal Development) to create a real-time adaptive learning engine that adjusts exercise difficulty based on student mastery signals
+
+- **Built an LLM-powered text simplification pipeline** (Groq LLaMA 3.3 70B) with structured JSON output, cognitive load scoring (Flesch + spaCy + textstat), fallback handling, and before/after difficulty reduction quantification
+
+- **Developed a composite Cognitive Load Scoring engine** using a weighted NLP formula (readability 40%, sentence complexity 30%, vocabulary difficulty 30%) with sentence-level heatmaps, difficult-word extraction, and reading time estimation
+
+### Accessibility & UX
+
+- **Designed an accessibility-first UI** with 14+ configurable parameters (OpenDyslexic font, 10 color overlays, reading rulers, b/d/p/q letter coloring, chunk reading, adjustable typography) — persisted via Zustand + localStorage
+
+- **Integrated multimodal input/output**: server-side TTS (gTTS) for audio playback, Web Speech API for voice-to-text dictation, keyboard shortcuts, and interactive vocabulary cards with tap-to-define on difficult words
+
+### Data & Analytics
+
+- **Built a user analytics dashboard** with cognitive load trend visualization (Recharts), session history tracking, AI-generated insights, and **exportable clinical PDF reports** (jsPDF) designed for educational assessment documentation
+
+- **Implemented an adaptive personalization engine** that tracks reading speed, sentence complexity tolerance, vocabulary difficulty tolerance, and session-level metrics to dynamically adjust simplification levels per user
+
+### Architecture & DevOps
+
+- **Architected a monorepo with safe-fail route loading** — backend routes are dynamically imported with graceful error handling, allowing partial functionality even if individual service modules fail
+
+- **Designed a Redis-first session store** with automatic in-memory fallback, storing BKT state, IRT estimates, SM-2 schedules, and exercise history per learning session with 24-hour TTL
+
+---
+
+## 8. Technology Stack Summary
+
+| Layer | Technologies |
+|---|---|
+| **Frontend** | React 19, TypeScript, Vite 7, TailwindCSS 3, Zustand 5, Framer Motion, GSAP, Three.js, Recharts, jsPDF, Tesseract.js |
+| **Backend** | Python, FastAPI, SQLAlchemy (SQLite), spaCy, textstat, NLTK, gTTS |
+| **AI/ML** | Groq API (LLaMA 3.3 70B), BKT, IRT (Rasch), SM-2, ZPD |
+| **Deployment** | Vercel (frontend), Render (backend), Redis (optional) |
+
+---
+
+## 9. Codebase Metrics
+
+| Metric | Value |
+|---|---|
+| Backend Python files | ~50+ modules |
+| Frontend Components | ~25 React components |
+| API Endpoints | ~30+ routes |
+| ML Models | 4 (BKT, IRT, SM-2, ZPD) |
+| Exercise Pool | 50+ curated exercises, 8 practice game types |
+| Accessibility Settings | 14+ configurable parameters |
+| Lines of Code (estimated) | ~8,000+ |
+| Deployment | Production (Vercel + Render), live URLs |
